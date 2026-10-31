@@ -1,58 +1,50 @@
-name: Validate and auto-merge pull requests
+name: PR Auto Merge (trusted)
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["PR Auto Merge Validation"]
+    types: [completed]
 permissions:
   contents: write
   pull-requests: write
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out PR head without executing PR workflows
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-      - name: Check for conflict markers
-        shell: bash
-        run: |
-          if git grep -n -E '^(<<<<<<< |=======|>>>>>>> )' -- ':!*.lock'; then exit 1; fi
-      - name: Check Python syntax
-        shell: bash
-        run: |
-          python - <<'PY'
-          import pathlib, ast
-          for p in pathlib.Path('.').rglob('*.py'):
-              if '.git' not in p.parts:
-                  ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
-          PY
-      - name: Run repository tests when configured
-        shell: bash
-        run: |
-          if [ -f pyproject.toml ] || [ -d tests ]; then
-            python -m pip install pytest
-            python -m pytest -q
-          elif [ -f package.json ]; then
-            echo 'Node tests require a dedicated repository workflow'; exit 1
-          else
-            echo 'No supported test configuration; manual gate required'; exit 1
-          fi
   merge:
-    needs: gate
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Mark ready and merge
+      - name: Verify exact successful PR run and merge
         uses: actions/github-script@v7
         with:
           script: |
-            const {owner,repo}=context.repo;
-            const number=context.issue.number;
-            const pr=(await github.rest.pulls.get({owner,repo,pull_number:number})).data;
-            if(pr.state!=='open'||pr.head.sha!==context.payload.pull_request.head.sha) return;
-            if(pr.draft) {
-              await github.graphql('mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){clientMutationId}}',{id:pr.node_id});
+            const run = context.payload.workflow_run;
+            const {owner, repo} = context.repo;
+            const fullName = owner + '/' + repo;
+            if(run.event !== 'pull_request' ||
+               run.name !== 'PR Auto Merge Validation' ||
+               !String(run.path || '').startsWith('.github/workflows/auto-merge-validate.yml')) return;
+            const associations = run.pull_requests || [];
+            let ids = associations.map(p => p.number);
+            if(!ids.length && run.head_repository?.full_name === fullName){
+              const all = await github.paginate(github.rest.pulls.list,{owner,repo,state:'open',per_page:100});
+              ids = all.filter(p=>p.head.sha === run.head_sha).map(p=>p.number);
             }
-            await github.rest.pulls.merge({owner,repo,pull_number:number,merge_method:'squash',sha:pr.head.sha});
+            for(const number of [...new Set(ids)]){
+              const {data: pr} = await github.rest.pulls.get({owner,repo,pull_number:number});
+              if(pr.state !== 'open' || pr.head.repo?.full_name !== fullName) continue;
+              const associated = associations.find(p=>p.number===number);
+              if(pr.head.sha !== run.head_sha && pr.head.sha !== associated?.head?.sha) continue;
+              const changed = await github.paginate(github.rest.pulls.listFiles,{owner,repo,pull_number:number,per_page:100});
+              if(changed.some(f=>f.filename.startsWith('.github/workflows/')||f.filename.startsWith('.github/actions/'))){
+                core.warning('Workflow changes require manual review: #' + number);
+                continue;
+              }
+              const {data: settings}=await github.rest.repos.get({owner,repo});
+              const method=settings.allow_squash_merge?'squash':settings.allow_merge_commit?'merge':settings.allow_rebase_merge?'rebase':null;
+              if(!method) throw new Error('No merge strategy enabled in repository settings');
+              if(pr.draft){
+                await github.graphql(
+                  'mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){clientMutationId}}',
+                  {id:pr.node_id});
+              }
+              await github.rest.pulls.merge({owner,repo,pull_number:number,merge_method:method,sha:pr.head.sha});
+              core.info('Merged validated PR #' + number);
+            }
